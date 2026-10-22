@@ -310,11 +310,10 @@ impl Decoder for TikTokenTokenizer {
         // only hit during incremental detokenization of byte-fallback tokens.
         let mut bytes = Vec::new();
         for id in ids {
-            bytes.extend_from_slice(
-                self.decoder
-                    .get(&id)
-                    .ok_or_else(|| Error::msg(format!("Unknown tiktoken ID: {id}")))?,
-            );
+            // Match CoreBPE: unknown IDs contribute no bytes.
+            if let Some(token) = self.decoder.get(&id) {
+                bytes.extend_from_slice(token);
+            }
         }
         match String::from_utf8(bytes) {
             Ok(text) => Ok(DecodeResult::Complete(text)),
@@ -759,6 +758,42 @@ mod tests {
             Encoding::Sp(_) => {}
             other => panic!("Expected Encoding::Sp, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_decode_skips_unknown_ids_and_preserves_specials() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = create_test_tiktoken_file(dir.path());
+        let special_tokens = FxHashMap::from_iter([("[BOS]".to_string(), 21_u32)]);
+        let tokenizer =
+            TikTokenTokenizer::from_file(&file_path, r"[\w]+|[^\w\s]+|\s+", special_tokens)
+                .unwrap();
+        for skip_special in [false, true] {
+            let text: String = tokenizer
+                .decode(&[u32::MAX, 19, u32::MAX, 4, 20, u32::MAX], skip_special)
+                .unwrap()
+                .into();
+            assert_eq!(text, "hello world");
+            let empty: String = tokenizer.decode(&[u32::MAX], skip_special).unwrap().into();
+            assert_eq!(empty, "");
+        }
+        let ids = [21, u32::MAX, 19];
+        let kept: String = tokenizer.decode(&ids, false).unwrap().into();
+        let skipped: String = tokenizer.decode(&ids, true).unwrap().into();
+        assert_eq!(kept, "[BOS]hello");
+        assert_eq!(skipped, "hello");
+    }
+
+    #[test]
+    fn test_decode_unknown_ids_preserve_incremental_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = create_byte_token_tokenizer(dir.path());
+        let complete = tokenizer.decode(&[100, u32::MAX, 101, 102], false).unwrap();
+        assert!(matches!(&complete, DecodeResult::Complete(text) if text == "你"));
+        let partial = tokenizer.decode(&[100, u32::MAX], false).unwrap();
+        assert_eq!(partial, tokenizer.decode(&[100], false).unwrap());
+        let replacement = tokenizer.decode(&[u32::MAX, 300], false).unwrap();
+        assert!(matches!(&replacement, DecodeResult::Complete(text) if text == "\u{fffd}"));
     }
 
     #[test]
