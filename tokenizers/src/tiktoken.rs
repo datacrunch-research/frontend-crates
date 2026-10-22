@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use fancy_regex::Regex;
@@ -23,14 +24,22 @@ const DEFAULT_NUM_RESERVED_SPECIAL_TOKENS: u32 = 256;
 /// Kimi BPE pattern. `fastokens` takes its Kimi scanner fast path only for this exact string.
 const KIMI_PATTERN: &str = fastokens::tiktoken::KIMI_PATTERN;
 
+// Match CoreBPE's bounded regex scratch bank. Sharing one regex makes find_at
+// contend on its mutable search scratch even though the tokenizer is immutable.
+const REGEX_SLOTS: usize = 128;
+static NEXT_REGEX_SLOT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static REGEX_SLOT: usize = NEXT_REGEX_SLOT.fetch_add(1, Ordering::Relaxed) % REGEX_SLOTS;
+}
+
 pub struct TikTokenTokenizer {
     // Keep tiktoken's regex and special-token boundaries. Only the merge algorithm changes;
     // using fastokens' full tokenizer would select a different Unicode scanner.
     bpe: PieceBpe,
     encoder: FxHashMap<Vec<u8>, u32>,
     decoder: FxHashMap<u32, Vec<u8>>,
-    regex: Regex,
-    special_regex: Option<Regex>,
+    regex: Vec<Regex>,
+    special_regex: Option<Vec<Regex>>,
     special_encoder: FxHashMap<String, u32>,
     special_token_ids: HashSet<u32>,
     special_tokens: Vec<String>,
@@ -121,8 +130,9 @@ impl TikTokenTokenizer {
             bpe,
             encoder,
             decoder,
-            regex,
-            special_regex,
+            regex: (0..REGEX_SLOTS).map(|_| regex.clone()).collect(),
+            special_regex: special_regex
+                .map(|regex| (0..REGEX_SLOTS).map(|_| regex.clone()).collect()),
             special_token_ids: skip_ids
                 .unwrap_or_else(|| special_encoder.values().copied().collect()),
             special_tokens: sorted_special_token_strings(&special_encoder),
@@ -148,8 +158,8 @@ impl TikTokenTokenizer {
         Self::new(encoder, tokens, Some(skip_ids), pattern)
     }
 
-    fn encode_ordinary_into(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
-        for matched in self.regex.find_iter(text) {
+    fn encode_ordinary_into(&self, text: &str, ids: &mut Vec<u32>, slot: usize) -> Result<()> {
+        for matched in self.regex[slot].find_iter(text) {
             let matched = matched.map_err(|err| Error::msg(err.to_string()))?;
             let piece = matched.as_str();
             if let Some(&rank) = self.encoder.get(piece.as_bytes()) {
@@ -167,16 +177,17 @@ impl TikTokenTokenizer {
     }
 
     fn encode_into(&self, text: &str, allow_special: bool, ids: &mut Vec<u32>) -> Result<()> {
+        let slot = REGEX_SLOT.with(|slot| *slot);
         let mut start = 0;
         if let Some(regex) = self.special_regex.as_ref().filter(|_| allow_special) {
-            for matched in regex.find_iter(text) {
+            for matched in regex[slot].find_iter(text) {
                 let matched = matched.map_err(|err| Error::msg(err.to_string()))?;
-                self.encode_ordinary_into(&text[start..matched.start()], ids)?;
+                self.encode_ordinary_into(&text[start..matched.start()], ids, slot)?;
                 ids.push(self.special_encoder[matched.as_str()]);
                 start = matched.end();
             }
         }
-        self.encode_ordinary_into(&text[start..], ids)
+        self.encode_ordinary_into(&text[start..], ids, slot)
     }
 
     /// Atomic special-token strings registered with the underlying TikToken BPE.
@@ -587,6 +598,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concurrent_encodes_preserve_unicode_and_special_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_byte_level_tiktoken_file(dir.path());
+        let special = FxHashMap::from_iter([("<|marker|>".to_string(), 1000)]);
+        let reference = CoreBPE::new(
+            parse_tiktoken_file(&path).unwrap(),
+            special.clone(),
+            KIMI_PATTERN,
+        )
+        .unwrap();
+        let tokenizer = TikTokenTokenizer::from_file(&path, KIMI_PATTERN, special).unwrap();
+        let text = "'ſ 汉🙂<|marker|>abc\r\n ";
+        let expected = [
+            reference.encode_ordinary(text),
+            reference.encode_with_special_tokens(text),
+        ];
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for worker in 0..16 {
+                let (tokenizer, expected, barrier) = (&tokenizer, &expected, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..50 {
+                        let allowed = (worker + iteration) % 2 == 0;
+                        let encoded = tokenizer
+                            .encode_segments(&[EncodeSegment::new(text, allowed)])
+                            .unwrap();
+                        assert_eq!(encoded.token_ids(), expected[usize::from(allowed)]);
+                    }
+                });
+            }
+        });
     }
 
     #[test]

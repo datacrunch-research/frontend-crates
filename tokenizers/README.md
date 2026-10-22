@@ -19,8 +19,9 @@ UTF-8 decoding. Dense merge-derived vocabularies use the existing fastokens heap
 BPE implementation within each original regex piece. This avoids a quadratic
 merge scan on long pieces without selecting fastokens' Unicode scanner or
 encoding segments in parallel. Sparse or non-merge-derived vocabularies keep the
-reference merge implementation. Callers still supply model-specific segment
-boundaries; BPE token IDs need not be invariant under arbitrary text cuts.
+reference merge implementation. A bounded bank of regex copies gives encoder
+threads separate search scratch, preserving the reference encoder's concurrency
+behavior. Callers still supply model-specific segment boundaries; BPE token IDs need not be invariant under arbitrary text cuts.
 
 The Kimi JSONL profiler reports IDs, elapsed encoding time and regex piece sizes:
 
