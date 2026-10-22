@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use base64::Engine as _;
+use fancy_regex::Regex;
+use fastokens::models::bpe::Bpe;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use tiktoken_rs::CoreBPE;
@@ -22,9 +24,23 @@ const DEFAULT_NUM_RESERVED_SPECIAL_TOKENS: u32 = 256;
 const KIMI_PATTERN: &str = fastokens::tiktoken::KIMI_PATTERN;
 
 pub struct TikTokenTokenizer {
-    bpe: CoreBPE,
+    // Keep tiktoken's regex and special-token boundaries. Only the merge algorithm changes;
+    // using fastokens' full tokenizer would select a different Unicode scanner.
+    bpe: PieceBpe,
+    encoder: FxHashMap<Vec<u8>, u32>,
+    decoder: FxHashMap<u32, Vec<u8>>,
+    regex: Regex,
+    special_regex: Option<Regex>,
+    special_encoder: FxHashMap<String, u32>,
     special_token_ids: HashSet<u32>,
     special_tokens: Vec<String>,
+}
+
+enum PieceBpe {
+    Heap(Box<Bpe>),
+    // Some callers supply partial or non-merge-derived vocabularies. Preserve their
+    // existing semantics rather than rejecting them while constructing the fast model.
+    Reference(Box<CoreBPE>),
 }
 
 pub(crate) fn sorted_special_token_strings(special_tokens: &FxHashMap<String, u32>) -> Vec<String> {
@@ -47,16 +63,70 @@ impl TikTokenTokenizer {
         special_tokens: FxHashMap<String, u32>,
     ) -> Result<Self> {
         let encoder = parse_tiktoken_file(path)?;
-        let special_token_ids: HashSet<u32> = special_tokens.values().copied().collect();
-        let special_token_strings = sorted_special_token_strings(&special_tokens);
+        Self::new(encoder, special_tokens, None, pattern)
+    }
 
-        let bpe = CoreBPE::new(encoder, special_tokens, pattern)
-            .map_err(|err| Error::msg(format!("Error creating tiktoken BPE: {err}")))?;
-
+    /// `skip_ids` are the ids `skip_special_tokens` removes; `None` means every added token.
+    fn new(
+        encoder: FxHashMap<Vec<u8>, u32>,
+        special_encoder: FxHashMap<String, u32>,
+        skip_ids: Option<HashSet<u32>>,
+        pattern: &str,
+    ) -> Result<Self> {
+        let regex = Regex::new(pattern).map_err(|err| Error::msg(err.to_string()))?;
+        let special_regex = if special_encoder.is_empty() {
+            None
+        } else {
+            // Preserve the same alternation order as CoreBPE for overlapping spellings.
+            let pattern = special_encoder
+                .keys()
+                .map(|s| fancy_regex::escape(s).into_owned())
+                .collect::<Vec<_>>()
+                .join("|");
+            Some(Regex::new(&pattern).map_err(|err| Error::msg(err.to_string()))?)
+        };
+        let ranks: Vec<_> = encoder
+            .iter()
+            .map(|(bytes, &rank)| (bytes.clone(), rank))
+            .collect();
+        // The heap model indexes ranks in arrays. Keep sparse IDs on the reference path
+        // so a tiny caller-supplied vocabulary cannot force an allocation up to max(ID).
+        let dense = encoder
+            .values()
+            .copied()
+            .max()
+            .is_some_and(|rank| u64::from(rank) + 1 == encoder.len() as u64);
+        let fast = if dense {
+            Bpe::from_tiktoken_ranks(&ranks)
+        } else {
+            Err("sparse ranks".into())
+        };
+        let bpe = match fast {
+            Ok(bpe) => PieceBpe::Heap(Box::new(bpe)),
+            Err(_) => PieceBpe::Reference(Box::new(
+                CoreBPE::new(encoder.clone(), FxHashMap::default(), r"(?s).+")
+                    .map_err(|err| Error::msg(format!("Error creating tiktoken BPE: {err}")))?,
+            )),
+        };
+        let mut decoder: FxHashMap<u32, Vec<u8>> = encoder
+            .iter()
+            .map(|(bytes, &rank)| (rank, bytes.clone()))
+            .collect();
+        for (text, &rank) in &special_encoder {
+            decoder
+                .entry(rank)
+                .or_insert_with(|| text.as_bytes().to_vec());
+        }
         Ok(Self {
             bpe,
-            special_token_ids,
-            special_tokens: special_token_strings,
+            encoder,
+            decoder,
+            regex,
+            special_regex,
+            special_token_ids: skip_ids
+                .unwrap_or_else(|| special_encoder.values().copied().collect()),
+            special_tokens: sorted_special_token_strings(&special_encoder),
+            special_encoder,
         })
     }
 
@@ -75,16 +145,38 @@ impl TikTokenTokenizer {
         // Use max rank + 1 (not len) to avoid ID collisions with sparse/non-contiguous ranks
         let num_base_tokens = encoder.values().max().map_or(0, |&m| m + 1) as usize;
         let AddedTokens { tokens, skip_ids } = load_added_tokens(directory, num_base_tokens)?;
-        let special_token_strings = sorted_special_token_strings(&tokens);
+        Self::new(encoder, tokens, Some(skip_ids), pattern)
+    }
 
-        let bpe = CoreBPE::new(encoder, tokens, pattern)
-            .map_err(|err| Error::msg(format!("Error creating tiktoken BPE: {err}")))?;
+    fn encode_ordinary_into(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        for matched in self.regex.find_iter(text) {
+            let matched = matched.map_err(|err| Error::msg(err.to_string()))?;
+            let piece = matched.as_str();
+            if let Some(&rank) = self.encoder.get(piece.as_bytes()) {
+                ids.push(rank);
+            } else {
+                match &self.bpe {
+                    PieceBpe::Heap(bpe) => {
+                        bpe.tokenize_into_fused(piece, ids).map_err(Error::msg)?
+                    }
+                    PieceBpe::Reference(bpe) => ids.extend(bpe.encode_ordinary(piece)),
+                }
+            }
+        }
+        Ok(())
+    }
 
-        Ok(Self {
-            bpe,
-            special_token_ids: skip_ids,
-            special_tokens: special_token_strings,
-        })
+    fn encode_into(&self, text: &str, allow_special: bool, ids: &mut Vec<u32>) -> Result<()> {
+        let mut start = 0;
+        if let Some(regex) = self.special_regex.as_ref().filter(|_| allow_special) {
+            for matched in regex.find_iter(text) {
+                let matched = matched.map_err(|err| Error::msg(err.to_string()))?;
+                self.encode_ordinary_into(&text[start..matched.start()], ids)?;
+                ids.push(self.special_encoder[matched.as_str()]);
+                start = matched.end();
+            }
+        }
+        self.encode_ordinary_into(&text[start..], ids)
     }
 
     /// Atomic special-token strings registered with the underlying TikToken BPE.
@@ -100,7 +192,8 @@ impl TikTokenTokenizer {
 
 impl Encoder for TikTokenTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        let token_ids: Vec<u32> = self.bpe.encode_with_special_tokens(input);
+        let mut token_ids = Vec::new();
+        self.encode_into(input, true, &mut token_ids)?;
         Ok(Encoding::Sp(token_ids))
     }
 
@@ -111,13 +204,13 @@ impl Encoder for TikTokenTokenizer {
     fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Encoding> {
         let mut token_ids = Vec::new();
         for segment in segments {
+            let mut result = Ok(());
             for_each_reference_piece(segment.text, |piece| {
-                if segment.allow_special {
-                    token_ids.extend(self.bpe.encode_with_special_tokens(piece));
-                } else {
-                    token_ids.extend(self.bpe.encode_ordinary(piece));
+                if result.is_ok() {
+                    result = self.encode_into(piece, segment.allow_special, &mut token_ids);
                 }
             });
+            result?;
         }
         Ok(Encoding::Sp(token_ids))
     }
@@ -204,7 +297,14 @@ impl Decoder for TikTokenTokenizer {
         // On failure, fall back to lossy conversion so partial multi-byte sequences
         // become U+FFFD, then classify via the trailing-FFFD heuristic. This path is
         // only hit during incremental detokenization of byte-fallback tokens.
-        let bytes: Vec<u8> = self.bpe._decode_native_and_split(ids).flatten().collect();
+        let mut bytes = Vec::new();
+        for id in ids {
+            bytes.extend_from_slice(
+                self.decoder
+                    .get(&id)
+                    .ok_or_else(|| Error::msg(format!("Unknown tiktoken ID: {id}")))?,
+            );
+        }
         match String::from_utf8(bytes) {
             Ok(text) => Ok(DecodeResult::Complete(text)),
             Err(e) => {
@@ -220,10 +320,7 @@ impl Tokenizer for TikTokenTokenizer {
         Ok(())
     }
 
-    // `tiktoken_rs::CoreBPE`'s `encoder` field is `pub(crate)`, so this
-    // crate has no way to enumerate, size, or look up ids in the vocab.
-    // `token_to_id` is left at the trait default (unsupported) for the
-    // same reason.
+    // Preserve the existing public introspection contract; model rank IDs may be sparse.
     fn vocab_size(&self) -> Option<usize> {
         None
     }
@@ -466,6 +563,92 @@ mod tests {
 
         let file_path = dir.join("tokenizer_config.json");
         std::fs::write(file_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sparse_and_non_merge_derived_vocabularies_keep_reference_semantics() {
+        for ranks in [
+            FxHashMap::from_iter([(b"a".to_vec(), 0), (b"b".to_vec(), 1_000_000)]),
+            FxHashMap::from_iter([
+                (b"a".to_vec(), 0),
+                (b"b".to_vec(), 1),
+                (b"c".to_vec(), 2),
+                (b"acb".to_vec(), 3),
+            ]),
+        ] {
+            let reference = CoreBPE::new(ranks.clone(), FxHashMap::default(), r"(?s).+").unwrap();
+            let tokenizer =
+                TikTokenTokenizer::new(ranks, FxHashMap::default(), None, r"(?s).+").unwrap();
+            assert!(matches!(tokenizer.bpe, PieceBpe::Reference(_)));
+            for text in ["a", "b", "abab"] {
+                assert_eq!(
+                    tokenizer.encode(text).unwrap().token_ids(),
+                    reference.encode_ordinary(text)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn heap_bpe_preserves_regex_unicode_specials_and_merge_ties() {
+        let mut ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8)
+            .map(|byte| (vec![byte], u32::from(byte)))
+            .collect();
+        for text in ["ſ", "'ſ", "'s", "ab", "bc", "abc", "aa", "aaaa", "aaaaaaaa"] {
+            let rank = ranks.len() as u32;
+            ranks.insert(text.as_bytes().to_vec(), rank);
+        }
+        let special = FxHashMap::from_iter([("<|marker|>".to_string(), 1000)]);
+        let reference = CoreBPE::new(ranks.clone(), special.clone(), KIMI_PATTERN).unwrap();
+        let tokenizer = TikTokenTokenizer::new(ranks, special, None, KIMI_PATTERN).unwrap();
+        assert!(matches!(tokenizer.bpe, PieceBpe::Heap(_)));
+        let mut cases = vec![
+            "a".repeat(4096),
+            " abcabcabab aaaaaaaabc".to_string(),
+            "'ſ 's I'ſ I'S<|marker|>a'ſ".to_string(),
+            "汉🙂\u{1c}  abc\r\n  ".repeat(50),
+        ];
+        let alphabet = [
+            "a",
+            "b",
+            "c",
+            "'",
+            "ſ",
+            "\n",
+            " ",
+            "汉",
+            "\u{1c}",
+            "🙂",
+            "<|marker|>",
+        ];
+        let mut state = 42u64;
+        for length in 0..256 {
+            let mut text = String::new();
+            for _ in 0..length {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push_str(alphabet[(state >> 32) as usize % alphabet.len()]);
+            }
+            cases.push(text);
+        }
+        for text in cases {
+            for allow_special in [false, true] {
+                let expected = if allow_special {
+                    reference.encode_with_special_tokens(&text)
+                } else {
+                    reference.encode_ordinary(&text)
+                };
+                let actual = tokenizer
+                    .encode_segments(&[EncodeSegment::new(&text, allow_special)])
+                    .unwrap();
+                assert_eq!(
+                    actual.token_ids(),
+                    expected,
+                    "{text:?}, special={allow_special}"
+                );
+                let decoded: String = tokenizer.decode(actual.token_ids(), false).unwrap().into();
+                assert_eq!(decoded, text);
+            }
+        }
     }
 
     #[test]
@@ -1055,12 +1238,17 @@ mod tests {
         let segmented = tokenizer
             .encode_segments(&[EncodeSegment::ordinary(&text)])
             .unwrap();
-        let mut expected = tokenizer.bpe.encode_ordinary(&text[..25_000]);
-        expected.extend(tokenizer.bpe.encode_ordinary(&text[25_000..]));
+        let ordinary = |text: &str| {
+            let mut ids = Vec::new();
+            tokenizer.encode_into(text, false, &mut ids).unwrap();
+            ids
+        };
+        let mut expected = ordinary(&text[..25_000]);
+        expected.extend(ordinary(&text[25_000..]));
         assert_eq!(segmented.token_ids(), expected.as_slice());
         assert_ne!(
             segmented.token_ids(),
-            tokenizer.bpe.encode_ordinary(&text).as_slice(),
+            ordinary(&text).as_slice(),
             "the cut must change ids for this input, or the test proves nothing"
         );
     }

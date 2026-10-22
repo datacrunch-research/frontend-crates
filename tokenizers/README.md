@@ -12,6 +12,31 @@ encode/decode/sequence API designed for streaming detokenization.
 - **Prefix caching.** `CachedTokenizer` records prefix tokenizations at special-token boundaries; repeated prompts that share a system prefix re-encode only the trailing suffix, turning O(N) work into O(suffix_len).
 - **Hash verification.** Detect tokenizer drift across model versions.
 
+## Tiktoken merge performance
+
+`TikTokenTokenizer` retains tiktoken's regex, special-token recognition and raw-byte
+UTF-8 decoding. Dense merge-derived vocabularies use the existing fastokens heap
+BPE implementation within each original regex piece. This avoids a quadratic
+merge scan on long pieces without selecting fastokens' Unicode scanner or
+encoding segments in parallel. Sparse or non-merge-derived vocabularies keep the
+reference merge implementation. Callers still supply model-specific segment
+boundaries; BPE token IDs need not be invariant under arbitrary text cuts.
+
+The Kimi JSONL profiler reports IDs, elapsed encoding time and regex piece sizes:
+
+```sh
+cargo run --release -p dynamo-tokenizers --example profile_tiktoken -- /path/to/tiktoken.model < jobs.jsonl
+```
+
+Each job has `text` and an optional `id`. Set `kimi_chunked` to apply Kimi's
+400,000-character windows and 25,000-character run cuts, or omit it to measure
+raw encoding. An optional `budget_seconds` makes the profiler fail if encoding
+exceeds a measured reference budget. Model loading, JSON and diagnostic piece
+inspection are outside the encoding timer; Kimi segmentation is inside it.
+Long pieces exceed fastokens' 15-byte pretoken-cache limit, so repeating those
+jobs does not cache the expensive merge results. The profiler adds no segment
+cache and does not parallelize the segments.
+
 ## Segmented prompts
 
 `BasetenTokenizer` supports segmented encoding for renderers such as Kimi K3's
