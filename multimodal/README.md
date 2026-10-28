@@ -72,7 +72,7 @@ prompt length (token costs)         │
 | --- | --- |
 | `processor` | the model-family seam: `MmFamilyProcessor` trait + data carriers |
 | `registry` | family selection from a typed/JSON spec, or resolved straight from the HF config files (the `AutoProcessor` entry) |
-| `models/` | one module per family — `models::qwen_vl` first |
+| `models/` | one module per family — `models::qwen_vl` (full pipeline); `deepseek_v41`, `glm5_next` and `kimi_k3` (metadata-only planners: token counts and prompt layout from image dimensions) |
 | `image/` | decode (8-bit only, PIL-matching), header-only dimension probe, bit-exact resize kernels, transforms |
 | `fetch` *(feature)* | `MediaFetcher`: protected fetcher for untrusted http(s)/data: URLs. Also a planned trusted-source helper (`fetch_bytes*`: data:/base64/file/http, `requests`-parity proxy semantics) that is still a stub returning `MmError::Unsupported` and is not for untrusted request URLs |
 | `video_decode` *(feature)* | `Video` (open once: `info`, `decode`, `decode_sampled`) and the one-shot `probe`, `decode_frames`, `decode_sampled`: MP4 / WebM / Matroska to the RGB frames a caller names, through NVDEC or libvpx, each frame resized by a `Fit` as it is decoded (§2.4) |

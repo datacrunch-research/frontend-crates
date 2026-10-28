@@ -8,6 +8,7 @@
 
 use crate::models::deepseek_v41::{DeepseekV41GeometrySpec, DeepseekV41Processor, DeepseekV41Spec};
 use crate::models::glm5_next::{Glm5NextGeometrySpec, Glm5NextProcessor, Glm5NextSpec};
+use crate::models::kimi_k3::{KimiK3GeometrySpec, KimiK3Processor, KimiK3Spec};
 use crate::models::qwen_vl::{QwenVlSpec, Resampler};
 use crate::{MmError, Result};
 use serde_json::Value;
@@ -25,6 +26,10 @@ pub enum ProcessorSpec {
     /// Metadata-only GLM-5.3-Flash image accounting and layout; pixel
     /// processing and video are unsupported.
     Glm5Next(Glm5NextSpec),
+    /// Metadata-only Kimi K3 image accounting and layout (the layout needs
+    /// the framing ids and a size tokenizer); pixel processing, video and
+    /// audio are unsupported.
+    KimiK3(KimiK3Spec),
 }
 
 // serde's internally tagged enum buffer treats arbitrary-precision decimals
@@ -38,6 +43,7 @@ impl TryFrom<Value> for ProcessorSpec {
             Some("qwen_vl") => serde_json::from_value(value).map(Self::QwenVl),
             Some("deepseek_v41") => serde_json::from_value(value).map(Self::DeepseekV41),
             Some("glm5_next") => serde_json::from_value(value).map(Self::Glm5Next),
+            Some("kimi_k3") => serde_json::from_value(value).map(Self::KimiK3),
             _ => Err(serde::de::Error::custom(
                 "unknown or missing processor family",
             )),
@@ -56,6 +62,7 @@ pub fn build_processor(
         )?)),
         ProcessorSpec::DeepseekV41(spec) => Ok(Box::new(DeepseekV41Processor::new(spec)?)),
         ProcessorSpec::Glm5Next(spec) => Ok(Box::new(Glm5NextProcessor::new(spec)?)),
+        ProcessorSpec::KimiK3(spec) => Ok(Box::new(KimiK3Processor::new(spec)?)),
     }
 }
 
@@ -96,6 +103,7 @@ pub fn spec_from_hf_configs(
             resolve_deepseek_v41(&config, &pre)?,
         )),
         Some("glm5_next") => Ok(ProcessorSpec::Glm5Next(resolve_glm5_next(&config, &pre)?)),
+        Some("kimi_k3") => Ok(ProcessorSpec::KimiK3(resolve_kimi_k3(&config, &pre)?)),
         Some(other) => Err(MmError::unsupported(format!(
             "no native processor for model_type {other:?}"
         ))),
@@ -290,6 +298,139 @@ fn resolve_glm5_next(config: &Value, pre: &Value) -> Result<Glm5NextSpec> {
     Ok(Glm5NextSpec {
         image_token_id,
         video_token_id: token_id("video_token_id")?,
+        geometry,
+    })
+}
+
+/// `media_proc_cfg` knobs [`resolve_kimi_k3`] consumes (`MoonViTMediaProcessorConfig`).
+const KIMI_K3_GEOMETRY: &[&str] = &[
+    "patch_size",
+    "merge_kernel_size",
+    "in_patch_limit",
+    "patch_limit_on_one_side",
+    "fixed_output_tokens",
+];
+
+/// `media_proc_cfg` knobs that shape pixel values or video sampling, never a
+/// still image's canvas, so a metadata-only planner can ignore them.
+const KIMI_K3_INERT: &[&str] = &[
+    "image_mean",
+    "image_std",
+    "in_patch_limit_each_frame",
+    "in_patch_limit_video",
+    "sample_fps",
+    "max_num_frames_each_video",
+    "temporal_merge_kernel_size",
+    "timestamp_mode",
+    "transparent_bg_config",
+    "transparent_bg_fill_stage",
+];
+
+/// The processor must be MoonViT's: its `navit_resize_config` is the mirrored
+/// geometry.
+const KIMI_K3_PINNED: &[(&str, Predicate)] = &[("config_type", |v| {
+    v.as_str()
+        .is_some_and(|name| name.ends_with("MoonViTMediaProcessorConfig"))
+})];
+
+/// Kimi K3's `preprocessor_config.json` nests the knobs under
+/// `media_proc_cfg` beside `auto_map`; `config.json` carries the pad id as
+/// `media_placeholder_token_id` and the vision tower's patch and merge sizes.
+/// The framing ids live in the tokenizer, so the spec leaves them unset.
+fn resolve_kimi_k3(config: &Value, pre: &Value) -> Result<KimiK3Spec> {
+    let top = pre
+        .as_object()
+        .ok_or_else(|| MmError::invalid_input("preprocessor_config.json is not an object"))?;
+    if let Some((name, _)) = top.iter().find(|(name, value)| {
+        !matches!(
+            name.as_str(),
+            "media_proc_cfg" | "auto_map" | "processor_class"
+        ) && !value.is_null()
+    }) {
+        return Err(MmError::unsupported(format!(
+            "unrecognized kimi_k3 preprocessor_config key {name}"
+        )));
+    }
+    let knobs = top
+        .get("media_proc_cfg")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            MmError::invalid_input("kimi_k3 preprocessor_config.json needs a media_proc_cfg object")
+        })?;
+    for (knob, value) in knobs {
+        let knob = knob.as_str();
+        if KIMI_K3_GEOMETRY.contains(&knob) || KIMI_K3_INERT.contains(&knob) {
+            continue;
+        }
+        match KIMI_K3_PINNED.iter().find(|(name, _)| *name == knob) {
+            Some((_, honored)) if honored(value) => {}
+            Some(_) => {
+                return Err(MmError::unsupported(format!(
+                    "kimi_k3 media_proc_cfg {knob} = {value} cannot be honored"
+                )));
+            }
+            None if value.is_null() => {}
+            None => {
+                return Err(MmError::unsupported(format!(
+                    "unrecognized kimi_k3 media_proc_cfg knob {knob}"
+                )));
+            }
+        }
+    }
+    let geometry: KimiK3GeometrySpec = serde_json::from_value(Value::Object(knobs.clone()))
+        .map_err(|error| {
+            MmError::invalid_input_with_source("invalid kimi_k3 media_proc_cfg geometry", error)
+        })?;
+    geometry.validate()?;
+    // The vision tower must agree with the processor: patch size, and a merge
+    // kernel it spells as a `[h, w]` pair.
+    if let Some(vision) = config
+        .get("vision_config")
+        .filter(|value| value.is_object())
+    {
+        if let Some(declared) = vision.get("patch_size").and_then(Value::as_u64)
+            && declared != u64::from(geometry.patch_size)
+        {
+            return Err(MmError::invalid_input(format!(
+                "kimi_k3: processor patch_size = {} disagrees with vision_config.patch_size = {declared}",
+                geometry.patch_size
+            )));
+        }
+        if let Some(merge) = vision.get("merge_kernel_size").filter(|v| !v.is_null()) {
+            let declared: Vec<u64> = match merge {
+                Value::Array(items) => items.iter().filter_map(Value::as_u64).collect(),
+                other => other.as_u64().into_iter().collect(),
+            };
+            if declared
+                .iter()
+                .any(|m| *m != u64::from(geometry.merge_kernel_size))
+            {
+                return Err(MmError::invalid_input(format!(
+                    "kimi_k3: processor merge_kernel_size = {} disagrees with vision_config.merge_kernel_size = {merge}",
+                    geometry.merge_kernel_size
+                )));
+            }
+        }
+    }
+    let media_pad_token_id = match config.get("media_placeholder_token_id") {
+        Some(value) if !value.is_null() => value
+            .as_i64()
+            .and_then(|id| i32::try_from(id).ok())
+            .filter(|id| *id >= 0)
+            .ok_or_else(|| {
+                MmError::invalid_input(
+                    "config.json media_placeholder_token_id must be a nonnegative i32",
+                )
+            })?,
+        _ => {
+            return Err(MmError::invalid_input(
+                "config.json is missing media_placeholder_token_id",
+            ));
+        }
+    };
+    Ok(KimiK3Spec {
+        media_pad_token_id,
+        framing: None,
         geometry,
     })
 }
