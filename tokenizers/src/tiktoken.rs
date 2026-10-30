@@ -203,9 +203,8 @@ impl TikTokenTokenizer {
 
 impl Encoder for TikTokenTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        let mut token_ids = Vec::new();
-        self.encode_into(input, true, &mut token_ids)?;
-        Ok(Encoding::Sp(token_ids))
+        // The reference Kimi tokenizer's `encode` makes the same cuts as a segment.
+        self.encode_segments(&[EncodeSegment::new(input, true)])
     }
 
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
@@ -1332,6 +1331,36 @@ mod tests {
             ordinary(&text).as_slice(),
             "the cut must change ids for this input, or the test proves nothing"
         );
+    }
+
+    #[test]
+    fn test_encode_cuts_long_runs_like_segment_encoding() {
+        // Byte vocabulary plus one merge ("aa"), so a cut inside an "aa" pair changes ids.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut content = String::new();
+        for byte_val in 0u16..256 {
+            let encoded = engine.encode([byte_val as u8]);
+            content.push_str(&format!("{encoded} {byte_val}\n"));
+        }
+        content.push_str(&format!("{} 256\n", engine.encode(b"aa")));
+        let file_path = dir.path().join("tiktoken.model");
+        std::fs::write(&file_path, &content).unwrap();
+        let tokenizer = TikTokenTokenizer::from_file(
+            file_path.to_str().unwrap(),
+            r"(?s).+",
+            FxHashMap::default(),
+        )
+        .unwrap();
+        let text = "b".to_string() + &"a".repeat(25_000);
+        let encoded = tokenizer.encode(&text).unwrap();
+        let segmented = tokenizer
+            .encode_segments(&[EncodeSegment::new(&text, true)])
+            .unwrap();
+        assert_eq!(encoded.token_ids(), segmented.token_ids());
+        let mut whole = Vec::new();
+        tokenizer.encode_into(&text, true, &mut whole).unwrap();
+        assert_ne!(encoded.token_ids(), whole.as_slice(), "the cut must apply");
     }
 
     fn has_nontrivial_self_overlap(token: &str) -> bool {
