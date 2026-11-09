@@ -53,9 +53,10 @@ pub fn deepseek_formatter_for(
     None
 }
 
-/// If the model is Kimi K3, return its native XTML formatter. K3 ships no
-/// Jinja chat template and must preserve special-vs-ordinary segment boundaries
-/// until tokenization.
+/// If the model is Kimi K3 or K3.1 (`model_type` `kimi_k3` or `kimi_k31`), return
+/// its native XTML formatter. Neither ships a Jinja chat template, both use the
+/// same XTML encoding and thinking efforts, and both must preserve
+/// special-vs-ordinary segment boundaries until tokenization.
 pub fn kimi_k3_formatter_for(
     model_type_lower: &Option<String>,
     display_name_lower: &str,
@@ -77,9 +78,9 @@ pub fn kimi_k3_formatter_for(
 
 fn is_kimi_k3(model_type_lower: &Option<String>, display_name_lower: &str) -> bool {
     match model_type_lower.as_deref() {
-        Some("kimi_k3") => true,
+        Some("kimi_k3" | "kimi_k31") => true,
         Some(_) => false,
-        None => ["kimi-k3", "kimi_k3", "kimik3"]
+        None => ["kimi-k3", "kimi_k3", "kimik3", "kimi_k31"]
             .iter()
             .any(|needle| display_name_lower.contains(needle)),
     }
@@ -324,12 +325,15 @@ mod detection_tests {
     #[test]
     fn kimi_k3_detection_prefers_config_model_type() {
         assert!(is_kimi_k3(&Some("kimi_k3".to_string()), "served-name"));
+        assert!(is_kimi_k3(&Some("kimi_k31".to_string()), "served-name"));
+        assert!(!is_kimi_k3(&Some("kimi_k32".to_string()), "kimi-k3"));
         assert!(!is_kimi_k3(
             &Some("kimi_k2".to_string()),
             "moonshot-kimi-k3"
         ));
         assert!(is_kimi_k3(&None, "moonshot-kimi-k3"));
         assert!(is_kimi_k3(&None, "kimi_k3-instruct"));
+        assert!(is_kimi_k3(&None, "moonshotai/kimi-k3.1-pro"));
         assert!(!is_kimi_k3(&None, "kimi-k2.5"));
     }
 
