@@ -395,7 +395,7 @@ pub(crate) fn detect_bpe_pattern(directory: &Path) -> Result<&'static str> {
         // it still ships the Kimi tiktoken tokenizer file, so the KIMI_PATTERN BPE regex is the
         // correct pattern to use.  No pure DeepSeek V3 model uses tiktoken.model files
         // (they use tokenizer.json instead) so this match is safe.
-        "kimi" | "kimi_k2" | "kimi_k25" | "kimi_k3" | "kimi_linear" | "deepseek_v3" => {
+        "kimi" | "kimi_k2" | "kimi_k25" | "kimi_k3" | "kimi_k31" | "kimi_linear" | "deepseek_v3" => {
             Ok(KIMI_PATTERN)
         }
         _ => Err(Error::msg(format!(
@@ -888,6 +888,14 @@ mod tests {
     fn test_kimi_k3_uses_kimi_bpe_pattern() {
         let dir = tempfile::tempdir().unwrap();
         create_test_config(dir.path(), "kimi_k3");
+        assert_eq!(detect_bpe_pattern(dir.path()).unwrap(), KIMI_PATTERN);
+    }
+
+    #[test]
+    fn test_kimi_k31_uses_kimi_bpe_pattern() {
+        // Kimi K3.1 (model_type kimi_k31) ships Kimi K3's tiktoken vocabulary byte for byte.
+        let dir = tempfile::tempdir().unwrap();
+        create_test_config(dir.path(), "kimi_k31");
         assert_eq!(detect_bpe_pattern(dir.path()).unwrap(), KIMI_PATTERN);
     }
 
